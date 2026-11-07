@@ -7,6 +7,14 @@
 Stream VR games from your PC to your headset via Wi-Fi.
 This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
 
+## Fork notes
+
+This fork targets the Lenovo ThinkReality VRX. Compared with upstream ALVR `v20.14.1`, it:
+
+- keeps SteamVR stable by installing the ALVR Windows crash handler only in `vrserver.exe`
+- restores a reliable 6DoF controller baseline and disables the unfinished hand-skeleton experiments
+- adapts the OpenXR client for the headset's Qualcomm runtime and external configuration files
+
 ### Direct download to the latest version:
 ### [Windows Launcher](https://github.com/alvr-org/ALVR/releases/latest/download/alvr_launcher_windows.zip) | [Linux Launcher](https://github.com/alvr-org/ALVR/releases/latest/download/alvr_launcher_linux.tar.gz)
 
