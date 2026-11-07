@@ -5,6 +5,22 @@
 #include <Windows.h>
 #include <ostream>
 
+static bool IsVrServerProcess() {
+    char path[MAX_PATH];
+    if (GetModuleFileNameA(nullptr, path, MAX_PATH) == 0) {
+        return false;
+    }
+
+    const char* filename = path;
+    for (const char* cursor = path; *cursor != '\0'; ++cursor) {
+        if (*cursor == '\\' || *cursor == '/') {
+            filename = cursor + 1;
+        }
+    }
+
+    return lstrcmpiA(filename, "vrserver.exe") == 0;
+}
+
 static LONG WINAPI handler(PEXCEPTION_POINTERS ptrs) {
     backward::StackTrace stacktrace;
     backward::Printer printer;
@@ -20,4 +36,10 @@ static LONG WINAPI handler(PEXCEPTION_POINTERS ptrs) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-void HookCrashHandler() { SetUnhandledExceptionFilter(handler); }
+void HookCrashHandler() {
+    // Steam can briefly load the external driver while probing it. Installing
+    // this process-wide handler there outlives the DLL unload and crashes Steam.
+    if (IsVrServerProcess()) {
+        SetUnhandledExceptionFilter(handler);
+    }
+}

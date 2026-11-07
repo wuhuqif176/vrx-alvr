@@ -30,6 +30,57 @@ const IPD_CHANGE_EPS: f32 = 0.001;
 // https://registry.khronos.org/OpenXR/specs/1.1/html/xrspec.html
 // Note: right controller offsets are calculated from left controller offsets by mirroring along the
 // Y-Z plane.
+// --- VRX (Lenovo ThinkReality devkit) live-tunable hand->controller offset -------------
+// Snapdragon Spaces (QXR) puts the XR_EXT_hand_tracking grip space at the WRIST, while the
+// OpenXR controller convention this function compensates for expects the origin roughly at
+// the centre of the palm. Upstream returns Pose::default() for unknown platforms, so nothing
+// is corrected here and the aim cursor lands on the wrist instead of the palm.
+//
+// Override file (left-hand frame: x,y,z metres then rx,ry,rz degrees; the right hand is
+// mirrored by the existing code below). Polled every 250 ms by vrx_offset_live() =>
+// the offset can be tuned while the app runs, no restart needed:
+//
+//   adb shell 'echo 0.0,-0.02,-0.09,0,0,0 > /storage/emulated/0/Android/data/alvr.client.stable/files/hand_offset.txt'
+//
+fn vrx_offset_override() -> Option<Pose> {
+    const DEG_TO_RAD: f32 = std::f32::consts::PI / 180.0;
+    const PATH: &str = "/storage/emulated/0/Android/data/alvr.client.stable/files/hand_offset.txt";
+    let text = std::fs::read_to_string(PATH).ok()?;
+    let vals: Vec<f32> = text
+        .trim()
+        .split(',')
+        .filter_map(|part| part.trim().parse::<f32>().ok())
+        .collect();
+    if vals.len() != 6 {
+        return None;
+    }
+    Some(Pose {
+        position: Vec3::new(vals[0], vals[1], vals[2]),
+        orientation: Quat::from_euler(
+            alvr_common::glam::EulerRot::XYZ,
+            vals[3] * DEG_TO_RAD,
+            vals[4] * DEG_TO_RAD,
+            vals[5] * DEG_TO_RAD,
+        ),
+    })
+}
+
+// Live re-read with a 250 ms cache: lets us sweep the offset from adb while the user watches
+// the controller, instead of restarting the app for every guess.
+fn vrx_offset_live() -> Option<Pose> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static CACHE: OnceLock<Mutex<(Instant, Option<Pose>)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(99), None)));
+    let mut guard = cache.lock().ok()?;
+    if guard.0.elapsed() >= Duration::from_millis(250) {
+        guard.0 = Instant::now();
+        guard.1 = vrx_offset_override();
+    }
+    guard.1
+}
+
 fn get_controller_offset(platform: Platform, is_right_hand: bool) -> Pose {
     const DEG_TO_RAD: f32 = std::f32::consts::PI / 180.0;
 
@@ -57,7 +108,7 @@ fn get_controller_offset(platform: Platform, is_right_hand: bool) -> Pose {
             position: Vec3::new(0.0, 0.0, -0.02),
             orientation: Quat::IDENTITY,
         },
-        _ => Pose::default(),
+        _ => vrx_offset_override().unwrap_or_default(),
     };
 
     if is_right_hand {
@@ -103,6 +154,7 @@ pub enum ButtonAction {
 pub struct HandInteraction {
     pub controllers_profile_id: u64,
     pub pose_offset: Pose,
+    pub subaction_path: xr::Path,
 
     pub grip_action: xr::Action<xr::Posef>,
     pub grip_space: xr::Space,
@@ -170,6 +222,7 @@ pub struct InteractionContext {
     platform: Platform,
     pub action_set: xr::ActionSet,
     pub button_actions: HashMap<u64, ButtonAction>,
+    pub button_subaction_paths: [xr::Path; 2],
     pub hands_interaction: [HandInteraction; 2],
     multimodal_handle: Option<MultimodalMeta>,
     pub multimodal_hands_enabled: bool,
@@ -189,6 +242,10 @@ impl InteractionContext {
         let action_set = xr_instance
             .create_action_set("alvr_interaction", "ALVR interaction", 0)
             .unwrap();
+
+        let left_hand_subaction_path = xr_instance.string_to_path(HAND_LEFT_PATH).unwrap();
+        let right_hand_subaction_path = xr_instance.string_to_path(HAND_RIGHT_PATH).unwrap();
+        let button_subaction_paths = [left_hand_subaction_path, right_hand_subaction_path];
 
         let mut bindings = vec![];
 
@@ -227,37 +284,70 @@ impl InteractionContext {
                 name[0..1].to_uppercase(),
                 name[1..].replace('_', " ")
             );
+            let subaction_path = if info.device_id == *HAND_RIGHT_ID {
+                right_hand_subaction_path
+            } else {
+                left_hand_subaction_path
+            };
 
             let action = match info.button_type {
                 ButtonType::Binary => ButtonAction::Binary(
-                    action_set.create_action(&name, &display_name, &[]).unwrap(),
+                    action_set
+                        .create_action(&name, &display_name, &[subaction_path])
+                        .unwrap(),
                 ),
                 ButtonType::Scalar => ButtonAction::Scalar(
-                    action_set.create_action(&name, &display_name, &[]).unwrap(),
+                    action_set
+                        .create_action(&name, &display_name, &[subaction_path])
+                        .unwrap(),
                 ),
             };
             button_actions.insert(*button_id, action);
         }
 
         let left_grip_action = action_set
-            .create_action("left_grip_pose", "Left grip pose", &[])
+            .create_action(
+                "left_grip_pose",
+                "Left grip pose",
+                &[left_hand_subaction_path],
+            )
             .unwrap();
         let right_grip_action = action_set
-            .create_action("right_grip_pose", "Right grip pose", &[])
+            .create_action(
+                "right_grip_pose",
+                "Right grip pose",
+                &[right_hand_subaction_path],
+            )
             .unwrap();
 
         let left_aim_action = action_set
-            .create_action("left_aim_pose", "Left aim pose", &[])
+            .create_action(
+                "left_aim_pose",
+                "Left aim pose",
+                &[left_hand_subaction_path],
+            )
             .unwrap();
         let right_aim_action = action_set
-            .create_action("right_aim_pose", "Right aim pose", &[])
+            .create_action(
+                "right_aim_pose",
+                "Right aim pose",
+                &[right_hand_subaction_path],
+            )
             .unwrap();
 
         let left_vibration_action = action_set
-            .create_action("left_hand_vibration", "Left hand vibration", &[])
+            .create_action(
+                "left_hand_vibration",
+                "Left hand vibration",
+                &[left_hand_subaction_path],
+            )
             .unwrap();
         let right_vibration_action = action_set
-            .create_action("right_hand_vibration", "Right hand vibration", &[])
+            .create_action(
+                "right_hand_vibration",
+                "Right hand vibration",
+                &[right_hand_subaction_path],
+            )
             .unwrap();
 
         // Create action bindings:
@@ -387,17 +477,33 @@ impl InteractionContext {
         xr_session.attach_action_sets(&[&action_set]).unwrap();
 
         let left_grip_space = left_grip_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .create_space(
+                xr_session.clone(),
+                left_hand_subaction_path,
+                xr::Posef::IDENTITY,
+            )
             .unwrap();
         let right_grip_space = right_grip_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .create_space(
+                xr_session.clone(),
+                right_hand_subaction_path,
+                xr::Posef::IDENTITY,
+            )
             .unwrap();
 
         let left_aim_space = left_aim_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .create_space(
+                xr_session.clone(),
+                left_hand_subaction_path,
+                xr::Posef::IDENTITY,
+            )
             .unwrap();
         let right_aim_space = right_aim_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .create_space(
+                xr_session.clone(),
+                right_hand_subaction_path,
+                xr::Posef::IDENTITY,
+            )
             .unwrap();
 
         let left_hand_tracker = create_ext_object("HandTracker (left)", Some(true), || {
@@ -431,10 +537,12 @@ impl InteractionContext {
             platform,
             action_set,
             button_actions,
+            button_subaction_paths,
             hands_interaction: [
                 HandInteraction {
                     controllers_profile_id,
                     pose_offset: get_controller_offset(platform, false),
+                    subaction_path: left_hand_subaction_path,
                     grip_action: left_grip_action,
                     grip_space: left_grip_space,
                     aim_action: left_aim_action,
@@ -445,6 +553,7 @@ impl InteractionContext {
                 HandInteraction {
                     controllers_profile_id,
                     pose_offset: get_controller_offset(platform, true),
+                    subaction_path: right_hand_subaction_path,
                     grip_action: right_grip_action,
                     grip_space: right_grip_space,
                     aim_action: right_aim_action,
@@ -685,32 +794,46 @@ pub fn get_head_data(
     };
 
     // Some headsets use wrong frame of reference for linear and angular velocities.
-    if platform.is_pico() || platform.is_vive() || platform.is_yvr() {
+    //
+    // QXR (Snapdragon Spaces, Lenovo VRX) leaves the XrSpaceVelocity flags unset for the view
+    // space, so the block above reports zero velocity. SteamVR then has nothing to extrapolate
+    // with and the whole world judders while the head moves. Recompute the velocities by
+    // finite-differencing the predicted pose whenever the runtime did not supply them, instead of
+    // only for the few platforms upstream knew about. Prediction failure is non-fatal: keep the
+    // frame, just without velocities, rather than dropping it.
+    let head_velocity_missing = !(head_velocity
+        .velocity_flags
+        .contains(xr::SpaceVelocityFlags::LINEAR_VALID)
+        && head_velocity
+            .velocity_flags
+            .contains(xr::SpaceVelocityFlags::ANGULAR_VALID));
+
+    if platform.is_pico() || platform.is_vive() || platform.is_yvr() || head_velocity_missing {
         let xr_future_time = crate::to_xr_time(future_time);
 
-        let predicted_location = view_reference_space
-            .locate(stage_reference_space, xr_future_time)
-            .ok()?;
-
-        if !predicted_location
-            .location_flags
-            .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
+        if let Ok(predicted_location) =
+            view_reference_space.locate(stage_reference_space, xr_future_time)
         {
-            return None;
-        }
+            if predicted_location
+                .location_flags
+                .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
+            {
+                let time_offset = future_time.saturating_sub(time);
 
-        let time_offset = future_time.saturating_sub(time);
+                if !time_offset.is_zero() {
+                    let time_offset_s = time_offset.as_secs_f32();
 
-        if !time_offset.is_zero() {
-            let time_offset_s = time_offset.as_secs_f32();
-
-            motion.linear_velocity = (crate::from_xr_vec3(predicted_location.pose.position)
-                - motion.pose.position)
-                / time_offset_s;
-            motion.angular_velocity = (crate::from_xr_quat(predicted_location.pose.orientation)
-                * motion.pose.orientation.inverse())
-            .to_scaled_axis()
-                / time_offset_s;
+                    motion.linear_velocity =
+                        (crate::from_xr_vec3(predicted_location.pose.position)
+                            - motion.pose.position)
+                            / time_offset_s;
+                    motion.angular_velocity =
+                        (crate::from_xr_quat(predicted_location.pose.orientation)
+                            * motion.pose.orientation.inverse())
+                        .to_scaled_axis()
+                            / time_offset_s;
+                }
+            }
         }
     }
 
@@ -753,7 +876,7 @@ pub fn get_hand_data(
 
     let controller_motion = if hand_source
         .grip_action
-        .is_active(xr_session, xr::Path::NULL)
+        .is_active(xr_session, hand_source.subaction_path)
         .unwrap_or(false)
     {
         if let Ok((location, velocity)) = hand_source.grip_space.relate(reference_space, xr_time) {
@@ -772,13 +895,34 @@ pub fn get_hand_data(
                 last_controller_pose.position = crate::from_xr_vec3(location.pose.position);
             }
 
-            let pose = *last_controller_pose * hand_source.pose_offset;
+            let pose = *last_controller_pose * vrx_offset_live().unwrap_or(hand_source.pose_offset);
 
-            let mut linear_velocity = crate::from_xr_vec3(velocity.linear_velocity);
-            let mut angular_velocity = crate::from_xr_vec3(velocity.angular_velocity);
+            // Upstream trusted XrSpaceVelocity here without checking the flags. When the runtime
+            // leaves them unset the struct contents are unspecified, so gate on the flags and fall
+            // back to finite differencing below (same reasoning as get_head_motion).
+            let velocity_linear_valid = velocity
+                .velocity_flags
+                .contains(xr::SpaceVelocityFlags::LINEAR_VALID);
+            let velocity_angular_valid = velocity
+                .velocity_flags
+                .contains(xr::SpaceVelocityFlags::ANGULAR_VALID);
+
+            let mut linear_velocity = if velocity_linear_valid {
+                crate::from_xr_vec3(velocity.linear_velocity)
+            } else {
+                Vec3::ZERO
+            };
+            let mut angular_velocity = if velocity_angular_valid {
+                crate::from_xr_vec3(velocity.angular_velocity)
+            } else {
+                Vec3::ZERO
+            };
 
             // Some headsets use wrong frame of reference for linear and angular velocities.
-            if platform.is_pico() || platform.is_vive() {
+            if platform.is_pico()
+                || platform.is_vive()
+                || !(velocity_linear_valid && velocity_angular_valid)
+            {
                 let xr_future_time = crate::to_xr_time(future_time);
 
                 let maybe_future_location = hand_source
@@ -866,12 +1010,19 @@ pub fn get_hand_data(
 pub fn update_buttons(
     xr_session: &xr::Session<xr::OpenGlEs>,
     button_actions: &HashMap<u64, ButtonAction>,
+    subaction_paths: &[xr::Path; 2],
 ) -> Vec<ButtonEntry> {
     let mut button_entries = Vec::with_capacity(2);
     for (id, action) in button_actions {
+        let info = BUTTON_INFO.get(id).unwrap();
+        let subaction_path = if info.device_id == *HAND_RIGHT_ID {
+            subaction_paths[1]
+        } else {
+            subaction_paths[0]
+        };
         match action {
             ButtonAction::Binary(action) => {
-                let Ok(state) = action.state(xr_session, xr::Path::NULL) else {
+                let Ok(state) = action.state(xr_session, subaction_path) else {
                     continue;
                 };
 
@@ -883,7 +1034,7 @@ pub fn update_buttons(
                 }
             }
             ButtonAction::Scalar(action) => {
-                let Ok(state) = action.state(xr_session, xr::Path::NULL) else {
+                let Ok(state) = action.state(xr_session, subaction_path) else {
                     continue;
                 };
 

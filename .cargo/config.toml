@@ -1,2 +1,6 @@
 [alias]
 xtask = "run -p alvr_xtask --"
+
+[target.aarch64-linux-android]
+linker = "E:/vrx/build/ndkwrap/cc.cmd"
+ar = "E:/vrx/build/android-ndk-r26d/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"

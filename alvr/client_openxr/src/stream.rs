@@ -643,7 +643,11 @@ fn stream_input_loop(
             face_data,
         );
 
-        let button_entries = interaction::update_buttons(&xr_session, &int_ctx.button_actions);
+        let button_entries = interaction::update_buttons(
+            &xr_session,
+            &int_ctx.button_actions,
+            &int_ctx.button_subaction_paths,
+        );
         if !button_entries.is_empty() {
             core_ctx.send_buttons(button_entries);
         }

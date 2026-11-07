@@ -14,7 +14,7 @@ use alvr_common::{
     glam::{Quat, UVec2, Vec3},
     info,
     parking_lot::RwLock,
-    Fov, Pose, HAND_LEFT_ID,
+    warn, Fov, Pose, HAND_LEFT_ID,
 };
 use alvr_graphics::GraphicsContext;
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig};
@@ -28,7 +28,13 @@ use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
 use openxr as xr;
 use passthrough::PassthroughLayer;
-use std::{path::Path, rc::Rc, sync::Arc, thread, time::Duration};
+use std::{
+    path::Path,
+    rc::Rc,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 use stream::StreamContext;
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
@@ -133,6 +139,43 @@ fn create_session(
     }
 }
 
+const DISABLED_EXTENSIONS_FILE: &str =
+    "/storage/emulated/0/Android/data/alvr.client.stable/files/disable_ext.txt";
+
+/// Names listed by the user in files/disable_ext.txt, one per line.
+fn read_disabled_extension_list() -> Vec<String> {
+    match std::fs::read_to_string(DISABLED_EXTENSIONS_FILE) {
+        Ok(text) => text
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect(),
+        Err(_) => vec![],
+    }
+}
+
+/// Clear the matching field of the advertised extension set. Unknown names are ignored so the
+/// list may keep entries that this ALVR version does not model.
+fn disable_extensions<'a, I: Iterator<Item = &'a str>>(set: &mut xr::ExtensionSet, names: I) {
+    for name in names {
+        match name {
+            "XR_FB_swapchain_update_state" => set.fb_swapchain_update_state = false,
+            "XR_FB_display_refresh_rate" => set.fb_display_refresh_rate = false,
+            "XR_FB_foveation" => set.fb_foveation = false,
+            "XR_FB_foveation_configuration" => set.fb_foveation_configuration = false,
+            "XR_FB_composition_layer_settings" => set.fb_composition_layer_settings = false,
+            "XR_EXT_eye_gaze_interaction" => set.ext_eye_gaze_interaction = false,
+            "XR_FB_passthrough" => set.fb_passthrough = false,
+            "XR_FB_color_space" => set.fb_color_space = false,
+            "XR_EXT_hand_tracking" => set.ext_hand_tracking = false,
+            "XR_EXT_hand_interaction" => set.ext_hand_interaction = false,
+            "XR_FB_body_tracking" => set.fb_body_tracking = false,
+            "XR_EXT_local_floor" => set.ext_local_floor = false,
+            other => alvr_common::warn!("disable_extensions: unknown extension {other}"),
+        }
+    }
+}
+
 pub fn entry_point() {
     alvr_client_core::init_logging();
 
@@ -156,7 +199,32 @@ pub fn entry_point() {
     #[cfg(target_os = "android")]
     xr_entry.initialize_android_loader().unwrap();
 
-    let available_extensions = xr_entry.enumerate_extensions().unwrap();
+    let mut available_extensions = xr_entry.enumerate_extensions().unwrap();
+    // QXR (Snapdragon Spaces) advertises the extensions below but returns NULL from
+    // xrGetInstanceProcAddr for their functions, so openxrs fails inside create_instance with
+    // ERROR_FUNCTION_UNSUPPORTED (lib.rs:225). Clearing the fields here means ALVR neither
+    // enables them nor resolves their entry points. Unlike patching libopenxr_monado.so this
+    // needs no root, so it survives a retail reflash. Hand tracking is deliberately NOT masked.
+    //
+    // Add more names without rebuilding (one per line, no root required):
+    //   adb shell 'mkdir -p /storage/emulated/0/Android/data/alvr.client.stable/files'
+    //   adb shell 'echo XR_FB_passthrough > /storage/emulated/0/Android/data/alvr.client.stable/files/disable_ext.txt'
+    let mut disabled_extensions: Vec<String> = [
+        "XR_FB_swapchain_update_state",
+        "XR_FB_display_refresh_rate",
+        "XR_FB_foveation",
+        "XR_FB_foveation_configuration",
+        "XR_FB_composition_layer_settings",
+        "XR_EXT_eye_gaze_interaction",
+    ]
+    .into_iter()
+    .map(|name| name.to_owned())
+    .collect();
+    disabled_extensions.extend(read_disabled_extension_list());
+    disable_extensions(
+        &mut available_extensions,
+        disabled_extensions.iter().map(|name| name.as_str()),
+    );
     alvr_common::info!("OpenXR available extensions: {available_extensions:#?}");
 
     // todo: switch to vulkan
@@ -166,6 +234,11 @@ pub fn entry_point() {
     exts.bd_controller_interaction = available_extensions.bd_controller_interaction;
     exts.ext_eye_gaze_interaction = available_extensions.ext_eye_gaze_interaction;
     exts.ext_hand_tracking = available_extensions.ext_hand_tracking;
+    // VRX (Lenovo ThinkReality devkit): the QCOM hand-tracking API layer only translates
+    // pinch -> action state when the app enables XR_EXT_hand_interaction.  Upstream ALVR
+    // never requests it, so the layer leaves HAND_INTERACTION_ENABLED=false and the
+    // runtime reports hand_tracking.left/right = <none>.  Request it when available.
+    exts.ext_hand_interaction = available_extensions.ext_hand_interaction;
     exts.ext_local_floor = available_extensions.ext_local_floor;
     exts.fb_body_tracking = available_extensions.fb_body_tracking;
     exts.fb_color_space = available_extensions.fb_color_space;
@@ -310,6 +383,7 @@ pub fn entry_point() {
             .select_sources(&lobby_interaction_sources);
 
         let mut session_running = false;
+        let mut session_begin_retry_at = None::<Instant>;
         let mut stream_context = None::<StreamContext>;
         let mut passthrough_layer = None;
 
@@ -323,24 +397,44 @@ pub fn entry_point() {
                     xr::Event::InstanceLossPending(_) => break 'session_loop,
                     xr::Event::SessionStateChanged(event) => match event.state() {
                         xr::SessionState::READY => {
-                            xr_session
-                                .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
-                                .unwrap();
-
-                            core_context.resume();
-
-                            passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
-
-                            session_running = true;
+                            match xr_session.begin(xr::ViewConfigurationType::PRIMARY_STEREO) {
+                                Ok(_) => {
+                                    core_context.resume();
+                                    passthrough_layer =
+                                        PassthroughLayer::new(&xr_session, platform).ok();
+                                    session_running = true;
+                                    session_begin_retry_at = None;
+                                }
+                                // QXR may report failure while the session has actually started.
+                                Err(e)
+                                    if e == xr::sys::Result::ERROR_SESSION_RUNNING
+                                        || e.into_raw() == -100_005_2000 =>
+                                {
+                                    error!("Failed to begin OpenXR session: {e}");
+                                    core_context.resume();
+                                    passthrough_layer =
+                                        PassthroughLayer::new(&xr_session, platform).ok();
+                                    session_running = true;
+                                    session_begin_retry_at = None;
+                                }
+                                Err(e) => {
+                                    error!("Failed to begin OpenXR session: {e}");
+                                    session_begin_retry_at =
+                                        Some(Instant::now() + Duration::from_millis(500));
+                                }
+                            }
                         }
                         xr::SessionState::STOPPING => {
                             session_running = false;
+                            session_begin_retry_at = None;
 
                             passthrough_layer = None;
 
                             core_context.pause();
 
-                            xr_session.end().unwrap();
+                            if let Err(e) = xr_session.end() {
+                                warn!("Failed to end OpenXR session: {e}");
+                            }
                         }
                         xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
                             break 'render_loop
@@ -377,6 +471,35 @@ pub fn entry_point() {
             }
 
             if !session_running {
+                if let Some(deadline) = session_begin_retry_at {
+                    if Instant::now() >= deadline {
+                        match xr_session.begin(xr::ViewConfigurationType::PRIMARY_STEREO) {
+                            Ok(_) => {
+                                core_context.resume();
+                                passthrough_layer =
+                                    PassthroughLayer::new(&xr_session, platform).ok();
+                                session_running = true;
+                                session_begin_retry_at = None;
+                            }
+                            Err(e)
+                                if e == xr::sys::Result::ERROR_SESSION_RUNNING
+                                    || e.into_raw() == -100_005_2000 =>
+                            {
+                                core_context.resume();
+                                passthrough_layer =
+                                    PassthroughLayer::new(&xr_session, platform).ok();
+                                session_running = true;
+                                session_begin_retry_at = None;
+                            }
+                            Err(e) => {
+                                error!("Retrying OpenXR session begin failed: {e}");
+                                session_begin_retry_at =
+                                    Some(Instant::now() + Duration::from_millis(500));
+                            }
+                        }
+                    }
+                }
+
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -423,13 +546,13 @@ pub fn entry_point() {
                         amplitude,
                     } => {
                         let idx = if device_id == *HAND_LEFT_ID { 0 } else { 1 };
-                        let action =
-                            &interaction_context.read().hands_interaction[idx].vibration_action;
+                        let hand_source = &interaction_context.read().hands_interaction[idx];
+                        let action = &hand_source.vibration_action;
 
                         action
                             .apply_feedback(
                                 &xr_session,
-                                xr::Path::NULL,
+                                hand_source.subaction_path,
                                 &xr::HapticVibration::new()
                                     .amplitude(amplitude.clamp(0.0, 1.0))
                                     .frequency(frequency.max(0.0))
